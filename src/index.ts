@@ -671,11 +671,13 @@ function collapse(s: string): string {
   return s.replace(/\s+/g, ' ').trim();
 }
 /**
- * Polymarket MCP — prediction-market data via Gamma + CLOB public APIs.
+ * Polymarket MCP — prediction-market data via Gamma + CLOB + Data public APIs.
  *
  * Polymarket runs binary-outcome prediction markets on Polygon. The Gamma API
  * (gamma-api.polymarket.com) exposes market and event metadata. The CLOB API
- * (clob.polymarket.com) exposes price history. Both are public; no auth.
+ * (clob.polymarket.com) exposes price history. The Data API
+ * (data-api.polymarket.com) exposes the trades tape, holder lists, and
+ * per-wallet positions/activity/PnL. All three are public; no auth.
  *
  * What agents typically want from this pack:
  * - "What does the market think about X?" → polymarket_search
@@ -683,8 +685,22 @@ function collapse(s: string): string {
  * - "Full detail / resolution criteria for one market" → polymarket_market
  * - "All markets within one event (e.g., 2028 election)" → polymarket_event
  * - "How has the Yes probability moved over time?" → polymarket_price_history
+ * - "What has this wallet bought/sold, and is it making money?" →
+ *   polymarket_wallet_positions / polymarket_wallet_activity /
+ *   polymarket_wallet_performance
+ * - "Has this market actually resolved, and when?" → polymarket_resolution_status
  *
  * Prices are quoted as probabilities in [0, 1]. outcomePrices[0] is Yes.
+ *
+ * Data API v1 → v2 migration (fleet #2713, 2026-10-07): Polymarket retires
+ * Data API v1 on 2026-10-24 (https://docs.polymarket.com/migrate/data-api-v1-to-v2).
+ * /trades and /holders (the two v1 routes this pack called) moved to
+ * /v2/trades and /v2/holders: same fields, wrapped in a `{ data, pagination }`
+ * envelope, snake_case instead of camelCase, and `market=<conditionId>` renamed
+ * to `condition=<conditionId>`. v1 still answers as of 2026-10-07 — confirmed
+ * live, byte-identical rows to v2 for the same market — but this pack calls
+ * v2 everywhere now rather than carrying a v1 fallback past the route this
+ * pack actually used being scheduled for removal.
  */
 
 
@@ -891,6 +907,117 @@ const tools: McpToolExport['tools'] = [
         limit: { type: 'number', description: 'Top N holders per outcome to return (1-100, default 10)' },
       },
       required: ['slug_or_id'],
+    },
+  },
+  {
+    name: 'polymarket_wallet_positions',
+    description:
+      'Open and closed positions for one Polymarket wallet — size, entry basis, current mark, and realized/unrealized P&L per position, plus portfolio-level exposure and concentration (how much of the wallet\'s capital sits in its single largest position — a concentration measure, not a measure of trading skill). Wallet addresses are public on-chain identifiers (0x…), looked up directly — no name/ENS resolution. Omit `status` to get OPEN + CLOSED together in one call; pass a specific status to filter. Use for "what is this wallet holding", "how exposed is this wallet to market X", "is this wallet up or down overall".',
+    summary: 'One Polymarket wallet\'s open and closed positions, with exposure, entry basis, and P&L per position.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        wallet: { type: 'string', description: 'Polymarket proxy wallet address, 0x-prefixed (40 hex chars). Get one from polymarket_holders or polymarket_trades on a market of interest.' },
+        status: { type: 'string', description: 'OPEN | CLOSED | REDEEMABLE | REDEEMABLE_LOST | MERGEABLE — filter to one lifecycle state. Omit to fetch OPEN and CLOSED together (default).' },
+        limit: { type: 'number', description: 'Rows per page, 1-500 (default 50).' },
+        cursor: { type: 'string', description: 'Opaque pagination cursor from a previous call\'s `next_cursor` — omit for the first page.' },
+      },
+      required: ['wallet'],
+    },
+    outputSchema: {
+      type: 'object' as const,
+      properties: {
+        wallet: { type: 'string' },
+        position_count: { type: 'number' },
+        total_current_value_usdc: { type: ['number', 'null'] },
+        total_realized_pnl_usdc: { type: ['number', 'null'] },
+        total_unrealized_pnl_usdc: { type: ['number', 'null'] },
+        largest_position_share_of_exposure: { type: ['number', 'null'], description: 'Largest single position\'s current_value as a fraction of total current_value — concentration, not skill.' },
+        positions: { type: 'array', items: { type: 'object' } },
+        next_cursor: { type: ['string', 'null'] },
+        data_as_of: { type: 'string', description: 'ISO timestamp when this response was fetched live from Polymarket Data API v2.' },
+      },
+    },
+  },
+  {
+    name: 'polymarket_wallet_activity',
+    description:
+      'Paginated activity feed (trades, redeems, splits, merges, rebates) for one Polymarket wallet over a period — newest first. Use for "what has this wallet done recently", "show me this wallet\'s trade history", "did this wallet trade market X". Distinct from polymarket_wallet_positions (current holdings) and polymarket_wallet_performance (aggregated P&L) — this is the raw event-by-event tape. Follow `next_cursor` to page past the current window.',
+    summary: 'Paginated trade/position-activity history for one Polymarket wallet over a period.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        wallet: { type: 'string', description: 'Polymarket proxy wallet address, 0x-prefixed (40 hex chars).' },
+        start_date: { type: 'string', description: 'ISO date/datetime — only activity at or after this time (default: no lower bound).' },
+        end_date: { type: 'string', description: 'ISO date/datetime — only activity at or before this time (default: no upper bound).' },
+        type: { type: 'string', description: 'Filter to one activity type, e.g. TRADE, REDEEM, SPLIT, MERGE, MAKER_REBATE (default: all types).' },
+        limit: { type: 'number', description: 'Rows per page, 1-500 (default 50).' },
+        cursor: { type: 'string', description: 'Opaque pagination cursor from a previous call\'s `next_cursor` — omit for the first page.' },
+      },
+      required: ['wallet'],
+    },
+    outputSchema: {
+      type: 'object' as const,
+      properties: {
+        wallet: { type: 'string' },
+        activity_count: { type: 'number' },
+        activity: { type: 'array', items: { type: 'object' } },
+        next_cursor: { type: ['string', 'null'] },
+        data_as_of: { type: 'string', description: 'ISO timestamp when this response was fetched live from Polymarket Data API v2.' },
+      },
+    },
+  },
+  {
+    name: 'polymarket_wallet_performance',
+    description:
+      'Lifetime and time-series P&L, volume, and activity stats for one Polymarket wallet — profile stats (distinct markets traded, biggest single win, profile join date) plus a cumulative P&L history on the requested interval/fidelity grid. States fee treatment explicitly: `realized_pnl` in each point is already NET of taker fees paid; maker rebates and other non-trading income (rewards, referrals) are reported separately in `wallet_income` and are additive on top, not already included in `realized_pnl`. Use for "is this wallet profitable overall", "how has this wallet\'s P&L moved over time", "how active is this wallet". Coverage: Polymarket\'s own PnL ledger starts from when the wallet\'s positions were first tracked — `source_fidelity` on each point says whether it is a native observation or synthesized onto a finer grid.',
+    summary: 'A Polymarket wallet\'s lifetime trading stats plus its cumulative P&L history over time, with fees stated explicitly.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        wallet: { type: 'string', description: 'Polymarket proxy wallet address, 0x-prefixed (40 hex chars).' },
+        interval: { type: 'string', description: '1d | 1w | 1m | all | max — the P&L history window (default max).' },
+        fidelity: { type: 'string', description: 'Grid step for the P&L series: 1h | 3h | 12h | 18h | 1d (default 1d). Finer grids only available for shorter intervals.' },
+      },
+      required: ['wallet'],
+    },
+    outputSchema: {
+      type: 'object' as const,
+      properties: {
+        wallet: { type: 'string' },
+        profile: { type: 'object', properties: { distinct_markets_traded: { type: 'number' }, biggest_win_usdc: { type: 'number' }, profile_views: { type: 'number' }, joined_at: { type: ['string', 'null'] } } },
+        fee_treatment: { type: 'string' },
+        pnl_history: { type: 'array', items: { type: 'object' } },
+        data_as_of: { type: 'string', description: 'ISO timestamp when this response was fetched live from Polymarket Data API v2.' },
+      },
+    },
+  },
+  {
+    name: 'polymarket_resolution_status',
+    description:
+      'Resolution lifecycle state and timestamps for one Polymarket market: initialized / posed / proposed / challenged / reproposed / disputed / resolved (or active/arbitration), whether it was disputed, the reporter (UMA_OO / Chainlink / EOA), and — once resolved — the exact resolution timestamp and per-outcome payouts. Use for "has this market actually settled yet", "when did market X resolve", "was this resolution disputed" — distinct from polymarket_market\'s `closed`/`active` flags, which reflect trading status, not oracle finality. Pass a market slug or numeric id (same input as polymarket_market).',
+    summary: 'A Polymarket market\'s oracle resolution state, dispute history, and (once resolved) settlement timestamp and payouts.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        slug_or_id: { type: 'string', description: 'Market slug or numeric id — same input as polymarket_market.' },
+      },
+      required: ['slug_or_id'],
+    },
+    outputSchema: {
+      type: 'object' as const,
+      properties: {
+        market_slug: { type: 'string' },
+        question: { type: 'string' },
+        status: { type: 'string' },
+        was_disputed: { type: 'boolean' },
+        extended_review: { type: 'boolean' },
+        resolved_at: { type: ['string', 'null'] },
+        expected_settlement_time: { type: ['string', 'null'] },
+        payouts: { type: ['array', 'null'], items: { type: 'number' } },
+        reporter: { type: ['string', 'null'] },
+        data_as_of: { type: 'string', description: 'ISO timestamp when this response was fetched live from Polymarket Data API v2.' },
+      },
     },
   },
 ];
@@ -1516,17 +1643,27 @@ async function polymarketEventBooks(args: Record<string, unknown>) {
   };
 }
 
-// data-api.polymarket.com — public, no auth; serves the trades tape and
-// holder lists keyed by conditionId (0x…).
-async function dataGet<T = unknown>(path: string, params: Record<string, string | number>): Promise<T> {
+// data-api.polymarket.com v2 — public, no auth; serves the trades tape,
+// holder lists, and per-wallet positions/activity/PnL. Every v2 route wraps
+// its payload in `{ data, pagination? }` — this helper unwraps it, so callers
+// get the inner `T` plus the pagination envelope when the route is paginated.
+// v1 (bare arrays, camelCase, `market=` param) retires 2026-10-24; see the
+// file-header comment (fleet #2713).
+interface V2Pagination { has_more?: boolean; limit?: number; next_cursor?: string | null; offset?: number }
+async function dataGetV2<T = unknown>(
+  path: string,
+  params: Record<string, string | number | boolean | undefined>,
+): Promise<{ data: T; pagination?: V2Pagination }> {
   const url = new URL(DATA_API + path);
-  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, String(v));
+  for (const [k, v] of Object.entries(params)) {
+    if (v !== undefined) url.searchParams.set(k, String(v));
+  }
   const res = await pwFetch(url.toString(), { headers: { Accept: 'application/json' } });
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(`Polymarket Data API: ${res.status} ${text.slice(0, 200)}`);
+    throw new Error(`Polymarket Data API v2: ${res.status} ${text.slice(0, 200)}`);
   }
-  return parseJson<T>(res, 'Polymarket');
+  return parseJson<{ data: T; pagination?: V2Pagination }>(res, 'Polymarket');
 }
 
 // Map an outcome index (0/1/…) to its label via the market's outcomes array.
@@ -1541,6 +1678,34 @@ function shortWallet(w?: string): string | null {
   return w.length > 12 ? `${w.slice(0, 6)}…${w.slice(-4)}` : w;
 }
 
+// Polymarket proxy wallets are standard 20-byte EVM addresses. Validate the
+// shape only — we never resolve an address to a name (ENS or otherwise);
+// addresses are public on-chain identifiers, not personal data (fleet #2713).
+function requireWallet(args: Record<string, unknown>): string {
+  const wallet = String(args.wallet ?? '').trim();
+  if (!/^0x[0-9a-fA-F]{40}$/.test(wallet)) {
+    throw new Error('wallet must be a 0x-prefixed 40-hex-char Polymarket proxy wallet address.');
+  }
+  return wallet.toLowerCase();
+}
+
+// ISO date/datetime (or a bare epoch-seconds string) → epoch seconds for the
+// v2 `start`/`end` params. Returns undefined (omit the param) on anything
+// unparseable rather than silently sending `NaN`.
+function toEpochSeconds(value: unknown): number | undefined {
+  if (value === undefined || value === null || value === '') return undefined;
+  const str = String(value).trim();
+  if (/^\d+$/.test(str)) return Number(str);
+  const ms = Date.parse(str);
+  return Number.isNaN(ms) ? undefined : Math.floor(ms / 1000);
+}
+
+function isoOrNull(epochSeconds: number | string | null | undefined): string | null {
+  if (epochSeconds === null || epochSeconds === undefined || epochSeconds === '') return null;
+  const n = Number(epochSeconds);
+  return Number.isFinite(n) ? new Date(n * 1000).toISOString() : null;
+}
+
 async function polymarketTrades(args: Record<string, unknown>) {
   const slugOrId = String(args.slug_or_id ?? '').trim();
   if (!slugOrId) throw new Error('slug_or_id is required.');
@@ -1550,10 +1715,10 @@ async function polymarketTrades(args: Record<string, unknown>) {
   if (!market.conditionId) return { error: 'no_condition_id', message: 'Market has no conditionId — trades unavailable.' };
 
   type RawTrade = {
-    proxyWallet?: string; name?: string; side?: string; size?: number; price?: number;
-    timestamp?: number; outcome?: string; outcomeIndex?: number;
+    proxy_wallet?: string; name?: string; side?: string; size?: number; price?: number;
+    timestamp?: number; outcome?: string; outcome_index?: number;
   };
-  const trades = await dataGet<RawTrade[]>('/trades', { market: market.conditionId, limit });
+  const { data: trades } = await dataGetV2<RawTrade[]>('/v2/trades', { condition: market.conditionId, limit });
 
   return {
     market_id: market.id,
@@ -1562,12 +1727,12 @@ async function polymarketTrades(args: Record<string, unknown>) {
     trade_count: trades.length,
     trades: trades.map((t) => ({
       side: t.side ?? null,
-      outcome: t.outcome ?? outcomeLabel(market, t.outcomeIndex),
+      outcome: t.outcome ?? outcomeLabel(market, t.outcome_index),
       size: t.size ?? null,
       price: t.price ?? null,
       usd_value: t.size != null && t.price != null ? Math.round(t.size * t.price * 100) / 100 : null,
       timestamp: t.timestamp ? new Date(t.timestamp * 1000).toISOString() : null,
-      trader: t.name || shortWallet(t.proxyWallet),
+      trader: t.name || shortWallet(t.proxy_wallet),
     })),
   };
 }
@@ -1580,26 +1745,260 @@ async function polymarketHolders(args: Record<string, unknown>) {
   if (!market) return { error: 'not_found', message: `No market matching "${slugOrId}".` };
   if (!market.conditionId) return { error: 'no_condition_id', message: 'Market has no conditionId — holders unavailable.' };
 
-  type RawHolder = { proxyWallet?: string; pseudonym?: string; name?: string; amount?: number; outcomeIndex?: number };
-  type RawHolderToken = { token?: string; holders?: RawHolder[] };
-  const data = await dataGet<RawHolderToken[]>('/holders', { market: market.conditionId, limit });
+  type RawHolder = { proxy_wallet?: string; pseudonym?: string; name?: string; amount?: number; outcome_index?: number };
+  type RawHolderToken = { token_id?: string; holders?: RawHolder[] };
+  const { data } = await dataGetV2<RawHolderToken[]>('/v2/holders', { condition: market.conditionId, limit });
 
   return {
     market_id: market.id,
     market_slug: market.slug,
     question: market.question,
     outcomes: (data ?? []).map((grp) => {
-      const idx = grp.holders?.[0]?.outcomeIndex;
+      const idx = grp.holders?.[0]?.outcome_index;
       return {
-        outcome: outcomeLabel(market, idx) ?? `token ${grp.token?.slice(0, 8)}…`,
-        token_id: grp.token ?? null,
+        outcome: outcomeLabel(market, idx) ?? `token ${grp.token_id?.slice(0, 8)}…`,
+        token_id: grp.token_id ?? null,
         top_holders: (grp.holders ?? []).slice(0, limit).map((h) => ({
-          trader: h.pseudonym || h.name || shortWallet(h.proxyWallet),
-          wallet: shortWallet(h.proxyWallet),
+          trader: h.pseudonym || h.name || shortWallet(h.proxy_wallet),
+          wallet: shortWallet(h.proxy_wallet),
           shares: h.amount ?? null,
         })),
       };
     }),
+  };
+}
+
+// ── Wallet analytics (fleet #2713) ────────────────────────────────────────
+// Four tools over Data API v2's per-wallet routes. Wallet addresses are
+// public on-chain identifiers; we validate the 0x-address shape and pass it
+// straight through — no ENS/name resolution anywhere in this section.
+
+type RawPosition = {
+  proxy_wallet: string; token_id: string; condition_id: string; title?: string; slug?: string;
+  event_slug?: string; outcome?: string; outcome_index?: number; current_size?: number;
+  avg_price?: number; entry_cost_usdc?: number; entry_fees_usdc?: number; total_cost_usdc?: number;
+  current_price?: number; current_value?: number; total_size?: number; realized_pnl?: number;
+  unrealized_pnl?: number; total_pnl?: number; percent_pnl?: number; percent_realized_pnl?: number;
+  status?: string; redeemable?: boolean; mergeable?: boolean; negative_risk?: boolean;
+  end_date?: string; last_event_at?: number; first_entry_at?: number;
+};
+
+function shapePosition(p: RawPosition) {
+  return {
+    market_slug: p.slug ?? null,
+    event_slug: p.event_slug ?? null,
+    question: p.title ?? null,
+    condition_id: p.condition_id,
+    outcome: p.outcome ?? null,
+    status: p.status ?? null,
+    current_size: p.current_size ?? null,
+    avg_entry_price: p.avg_price ?? null,
+    entry_cost_usdc: p.entry_cost_usdc ?? null,
+    entry_fees_usdc: p.entry_fees_usdc ?? null,
+    current_price: p.current_price ?? null,
+    current_value_usdc: p.current_value ?? null,
+    realized_pnl_usdc: p.realized_pnl ?? null,
+    unrealized_pnl_usdc: p.unrealized_pnl ?? null,
+    total_pnl_usdc: p.total_pnl ?? null,
+    percent_pnl: p.percent_pnl ?? null,
+    redeemable: p.redeemable ?? null,
+    mergeable: p.mergeable ?? null,
+    end_date: p.end_date ?? null,
+    last_activity_at: isoOrNull(p.last_event_at ?? null),
+    first_entry_at: isoOrNull(p.first_entry_at ?? null),
+  };
+}
+
+const POSITION_STATUSES = ['OPEN', 'REDEEMABLE', 'REDEEMABLE_LOST', 'MERGEABLE', 'CLOSED'];
+
+async function polymarketWalletPositions(args: Record<string, unknown>) {
+  const wallet = requireWallet(args);
+  const limit = Math.min(500, Math.max(1, Number(args.limit ?? 50)));
+  const cursor = args.cursor ? String(args.cursor) : undefined;
+  const statusArg = args.status ? String(args.status).trim().toUpperCase() : undefined;
+  if (statusArg && !POSITION_STATUSES.includes(statusArg)) {
+    throw new Error(`Invalid status "${statusArg}". Valid: ${POSITION_STATUSES.join(' | ')}, or omit for OPEN+CLOSED.`);
+  }
+
+  let rows: RawPosition[];
+  let nextCursor: string | null = null;
+  if (statusArg) {
+    const { data, pagination } = await dataGetV2<RawPosition[]>('/v2/positions', { user: wallet, status: statusArg, limit, cursor });
+    rows = data ?? [];
+    nextCursor = pagination?.next_cursor ?? null;
+  } else {
+    // No status filter requested — the API defaults to the OPEN lifecycle
+    // states on an unfiltered call, so fetch CLOSED explicitly and merge, to
+    // actually deliver "open + closed" as one call. Pagination (`cursor`)
+    // only applies cleanly within a single status, so a caller paging needs
+    // to pass `status` explicitly from the second page on.
+    const [openRes, closedRes] = await Promise.all([
+      dataGetV2<RawPosition[]>('/v2/positions', { user: wallet, limit, cursor }),
+      dataGetV2<RawPosition[]>('/v2/positions', { user: wallet, status: 'CLOSED', limit, cursor }),
+    ]);
+    rows = [...(openRes.data ?? []), ...(closedRes.data ?? [])];
+    nextCursor = openRes.pagination?.next_cursor ?? closedRes.pagination?.next_cursor ?? null;
+  }
+
+  const totalCurrentValue = rows.reduce((sum, p) => sum + (p.current_value ?? 0), 0);
+  const totalRealized = rows.reduce((sum, p) => sum + (p.realized_pnl ?? 0), 0);
+  const totalUnrealized = rows.reduce((sum, p) => sum + (p.unrealized_pnl ?? 0), 0);
+  const largestValue = rows.reduce((max, p) => Math.max(max, p.current_value ?? 0), 0);
+
+  return {
+    wallet,
+    position_count: rows.length,
+    total_current_value_usdc: Math.round(totalCurrentValue * 100) / 100,
+    total_realized_pnl_usdc: Math.round(totalRealized * 100) / 100,
+    total_unrealized_pnl_usdc: Math.round(totalUnrealized * 100) / 100,
+    // Concentration, not skill: how much of current exposure sits in the
+    // single largest position. A wallet all-in on one market is highly
+    // concentrated whether that bet is working out or not.
+    largest_position_share_of_exposure: totalCurrentValue > 0 ? Math.round((largestValue / totalCurrentValue) * 10000) / 10000 : null,
+    positions: rows.map(shapePosition),
+    next_cursor: nextCursor,
+    data_as_of: new Date().toISOString(),
+  };
+}
+
+type RawActivity = {
+  timestamp?: number; condition_id?: string; type?: string; size?: number; usdc_size?: number;
+  price?: number; side?: string; outcome?: string; outcome_index?: number; title?: string;
+  slug?: string; event_slug?: string; transaction_hash?: string;
+};
+
+async function polymarketWalletActivity(args: Record<string, unknown>) {
+  const wallet = requireWallet(args);
+  const limit = Math.min(500, Math.max(1, Number(args.limit ?? 50)));
+  const cursor = args.cursor ? String(args.cursor) : undefined;
+  const type = args.type ? String(args.type).trim().toUpperCase() : undefined;
+  const start = toEpochSeconds(args.start_date);
+  const end = toEpochSeconds(args.end_date);
+
+  const { data, pagination } = await dataGetV2<RawActivity[]>('/v2/activity', {
+    user: wallet, limit, cursor, type, start, end,
+  });
+  const rows = data ?? [];
+
+  return {
+    wallet,
+    activity_count: rows.length,
+    activity: rows.map((a) => ({
+      type: a.type ?? null,
+      side: a.side || null,
+      market_slug: a.slug || null,
+      event_slug: a.event_slug || null,
+      question: a.title || null,
+      outcome: a.outcome || null,
+      size: a.size ?? null,
+      usdc_value: a.usdc_size ?? null,
+      price: a.price ?? null,
+      timestamp: a.timestamp ? new Date(a.timestamp * 1000).toISOString() : null,
+      transaction_hash: a.transaction_hash || null,
+    })),
+    next_cursor: pagination?.next_cursor ?? null,
+    data_as_of: new Date().toISOString(),
+  };
+}
+
+type RawUserPnlPoint = {
+  timestamp?: number; realized_pnl?: number; unrealized_pnl?: number; fees?: number; fees_paid?: number;
+  fees_refunded?: number; maker_rebate?: number; taker_rebate?: number; wallet_income?: number;
+  settled_pnl?: number; economic_pnl?: number; trade_pnl?: number; volume?: number; volume_usdc?: number;
+  trade_count?: number;
+};
+type RawUserStats = {
+  proxy_wallet?: string; trades?: number; biggest_win?: number; views?: number; join_date?: number | null;
+  all_time_pnl?: RawUserPnlPoint | null;
+};
+
+const FEE_TREATMENT =
+  'realized_pnl at each point is already NET of taker trading fees paid (fees_paid is broken out separately for reference). ' +
+  'Maker rebates and other non-trading income (rewards, referrals, sponsorships) are reported in wallet_income and are ' +
+  'ADDITIVE on top — they are included in settled_pnl/economic_pnl but NOT in realized_pnl. unrealized_pnl marks open ' +
+  'positions to current price and is not yet realized or fee-adjusted.';
+
+async function polymarketWalletPerformance(args: Record<string, unknown>) {
+  const wallet = requireWallet(args);
+  const interval = String(args.interval ?? 'max');
+  const fidelity = args.fidelity ? String(args.fidelity) : undefined;
+
+  const [pnlRes, statsRes] = await Promise.all([
+    dataGetV2<RawUserPnlPoint[] | { points?: RawUserPnlPoint[] }>('/v2/user-pnl', { user: wallet, interval, fidelity }),
+    dataGetV2<RawUserStats | null>('/v2/user-stats', { user: wallet }),
+  ]);
+
+  // /v2/user-pnl's `data` is the UserPnlSeries object ({ points: [...] }),
+  // not a bare array — handle both shapes defensively in case that changes.
+  const pnlData = pnlRes.data as { points?: RawUserPnlPoint[] } | RawUserPnlPoint[];
+  const points: RawUserPnlPoint[] = Array.isArray(pnlData) ? pnlData : (pnlData?.points ?? []);
+  const stats = statsRes.data;
+
+  return {
+    wallet,
+    profile: stats
+      ? {
+          distinct_markets_traded: stats.trades ?? null,
+          biggest_win_usdc: stats.biggest_win ?? null,
+          profile_views: stats.views ?? null,
+          joined_at: isoOrNull(stats.join_date ?? null),
+        }
+      : null,
+    fee_treatment: FEE_TREATMENT,
+    pnl_history: points.map((p) => ({
+      timestamp: p.timestamp ? new Date(p.timestamp * 1000).toISOString() : null,
+      realized_pnl_usdc: p.realized_pnl ?? null,
+      unrealized_pnl_usdc: p.unrealized_pnl ?? null,
+      fees_paid_usdc: p.fees_paid ?? null,
+      fees_refunded_usdc: p.fees_refunded ?? null,
+      maker_rebate_usdc: p.maker_rebate ?? null,
+      wallet_income_usdc: p.wallet_income ?? null,
+      settled_pnl_usdc: p.settled_pnl ?? null,
+      volume_usdc: p.volume_usdc ?? p.volume ?? null,
+      trade_count: p.trade_count ?? null,
+    })),
+    data_as_of: new Date().toISOString(),
+  };
+}
+
+type RawResolution = {
+  status?: string; was_disputed?: boolean; extended_review?: boolean; resolved_at?: string | null;
+  expected_settlement_time?: string | null; payouts?: number[] | null; reporter?: string | null;
+  resolution_source?: string | null; was_arbitrated?: boolean | null;
+};
+
+async function polymarketResolutionStatus(args: Record<string, unknown>) {
+  const slugOrId = String(args.slug_or_id ?? '').trim();
+  if (!slugOrId) throw new Error('slug_or_id is required.');
+  const market = await lookupMarket(slugOrId);
+  if (!market) return { error: 'not_found', message: `No market matching "${slugOrId}".` };
+  if (!market.conditionId) return { error: 'no_condition_id', message: 'Market has no conditionId — resolution status unavailable.' };
+
+  const { data } = await dataGetV2<RawResolution[]>('/v2/resolutions', { condition: market.conditionId });
+  const res = data?.[0];
+  if (!res) {
+    return {
+      market_slug: market.slug,
+      question: market.question,
+      status: 'unresolved',
+      message: 'No resolution lifecycle row yet for this market\'s condition.',
+      data_as_of: new Date().toISOString(),
+    };
+  }
+
+  return {
+    market_slug: market.slug,
+    question: market.question,
+    status: res.status ?? null,
+    was_disputed: res.was_disputed ?? false,
+    extended_review: res.extended_review ?? false,
+    resolved_at: res.resolved_at ?? null,
+    expected_settlement_time: res.expected_settlement_time ?? null,
+    payouts: res.payouts ?? null,
+    reporter: res.reporter ?? null,
+    resolution_source: res.resolution_source ?? null,
+    was_arbitrated: res.was_arbitrated ?? null,
+    data_as_of: new Date().toISOString(),
   };
 }
 
@@ -1623,6 +2022,14 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
       return polymarketTrades(args);
     case 'polymarket_holders':
       return polymarketHolders(args);
+    case 'polymarket_wallet_positions':
+      return polymarketWalletPositions(args);
+    case 'polymarket_wallet_activity':
+      return polymarketWalletActivity(args);
+    case 'polymarket_wallet_performance':
+      return polymarketWalletPerformance(args);
+    case 'polymarket_resolution_status':
+      return polymarketResolutionStatus(args);
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
