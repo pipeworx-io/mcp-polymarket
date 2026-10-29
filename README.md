@@ -2,7 +2,7 @@
 
 Polymarket MCP — prediction-market data via Gamma + CLOB + Data public APIs.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1704+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1856+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
 
 ## Tools
 
@@ -15,7 +15,7 @@ Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents 
 | `polymarket_price_history` | Historical probability time-series for one Polymarket market. Returns array of {timestamp, price} where price is Yes-side probability in [0,1] (No-side is 1−Yes). Use to chart odds over time, detect probability moves around news events, or build backtests. Intervals 1h \| 6h \| 1d \| 1w \| 1m \| max — supports up to a month (1m) and full history (max). A young market may have less data than the requested window; the `coverage` field reports the actual span and whether it is the full available history (a data limit, not a tool limit). |
 | `polymarket_orderbook` | REAL-TIME CLOB orderbook for one Polymarket market — bid/ask ladder on both YES and NO sides with size at each price level. Use to check actual tradable depth before quoting a size estimate; the `liquidity` field on polymarket_market is a rolled-up summary, this is the actual ladder. Returns yes_bids[], yes_asks[], no_bids[], no_asks[] each as [price, size] pairs sorted from inside the book outward. Necessary input before any "you could buy $X at price Y" answer — without depth that's a guess. |
 | `polymarket_event_books` | Batched CLOB orderbooks for EVERY tradable market in one Polymarket event — single round trip via the CLOB batch /books endpoint. Use before any multi-leg strategy (partition arbitrage "SELL/BUY EVERY LEG", basket trades) to check per-leg depth: theoretical overround means nothing if half the legs are 50-share books. Returns legs[] with {slug, question, yes_price, best_bid, best_ask, yes_bids[], yes_asks[]} where bids are sorted best(highest)-first and asks best(lowest)-first as {price, size} objects. Pass include_no=true to also fetch NO-side books (doubles payload — only needed for NO-leg strategies). Caps at 80 legs (highest yes_price kept; truncated_legs reports the cut). |
-| `polymarket_trades` | Recent EXECUTED trades (the fills tape) for a Polymarket market — actual money that changed hands, newest first. Each trade: side (BUY/SELL), outcome (Yes/No or the option name), size (shares), price, timestamp, and the trader's wallet/pseudonym. Use for "what's the recent order flow", "is smart money buying Yes", "how much just traded and at what price". DISTINCT from polymarket_orderbook (resting/unfilled orders — intent) and polymarket_price_history (the CP time-series). Pass a market slug or numeric id (same input as polymarket_market). |
+| `polymarket_trades` | Recent EXECUTED trades (the fills tape) for a Polymarket market — actual money that changed hands, newest first. Each trade: side (BUY/SELL), outcome (Yes/No or the option name), outcome_index, size (shares), price (that fill's OWN outcome's price), unix, timestamp, and the trader's wallet/pseudonym. Use for "what's the recent order flow", "is smart money buying Yes", "how much just traded and at what price". DISTINCT from polymarket_orderbook (resting/unfilled orders — intent) and polymarket_price_history (the CP time-series). Pass a market slug or numeric id (same input as polymarket_market). PAGING: `limit` goes to 1000; follow `next_cursor` to walk further back. To measure a whole time window rather than the tail (e.g. what takers actually paid across one 15-minute crypto window) pass `window_start` (+ `window_end`): the tool walks the tape back to the window start itself and returns `coverage` saying whether the walk reached it or ran out of page budget, plus a size-weighted `per_minute` fill-price summary on the first outcome's side. |
 | `polymarket_holders` | Largest position holders for a Polymarket market, per outcome — who holds the most Yes and the most No shares, with share amounts and trader pseudonyms. Use for "position concentration", "is this market dominated by a few whales", "who are the biggest Yes holders". Reveals conviction/concentration that price alone hides. Pass a market slug or numeric id (same input as polymarket_market). |
 | `polymarket_wallet_positions` | Open and closed positions for one Polymarket wallet — size, entry basis, current mark, and realized/unrealized P&L per position, plus portfolio-level exposure and concentration (how much of the wallet's capital sits in its single largest position — a concentration measure, not a measure of trading skill). Wallet addresses are public on-chain identifiers (0x…), looked up directly — no name/ENS resolution. Omit `status` to get OPEN + CLOSED together in one call; pass a specific status to filter. Use for "what is this wallet holding", "how exposed is this wallet to market X", "is this wallet up or down overall". |
 | `polymarket_wallet_activity` | Paginated activity feed (trades, redeems, splits, merges, rebates) for one Polymarket wallet over a period — newest first. Use for "what has this wallet done recently", "show me this wallet's trade history", "did this wallet trade market X". Distinct from polymarket_wallet_positions (current holdings) and polymarket_wallet_performance (aggregated P&L) — this is the raw event-by-event tape. Follow `next_cursor` to page past the current window. |
@@ -66,7 +66,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1704+ data sources. The
+Both URLs reach the same gateway and the same 1856+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 
@@ -80,10 +80,12 @@ curl -X POST https://gateway.pipeworx.io/v1/tools/polymarket_search \
 
 No account needed for the first calls. Inspect any tool: `GET https://gateway.pipeworx.io/v1/tools/polymarket_search`. Find one: `POST https://gateway.pipeworx.io/v1/tools/search_packs` with `{"query":"..."}`.
 
-## Standalone (no gateway account)
+## Run it from npm
 
-This package also runs as a local stdio MCP server — no Pipeworx account, no
-gateway round-trip:
+`@pipeworx/mcp-polymarket` is a local stdio bridge to the Pipeworx gateway: your MCP client
+starts it with `npx`, and it forwards every call to the same
+`https://gateway.pipeworx.io/polymarket/mcp` endpoint shown above. It needs network access;
+there is no offline mode.
 
 ```json
 {
@@ -96,15 +98,18 @@ gateway round-trip:
 }
 ```
 
-Or run it directly to confirm it starts:
+Without a key it calls anonymously, capped at 50 calls a day. A free account
+raises that to 200 a day: get a key at https://pipeworx.io/signup and add
+`"env": { "PIPEWORX_API_KEY": "<your key>" }` to the server entry.
+The key is sent as a Bearer token, the same way a hosted connection sends it,
+so calls are metered and billed exactly as they are there.
 
-```bash
-npx -y @pipeworx/mcp-polymarket
-```
+It lists **only** this pack's tools by default. Set `PIPEWORX_META_TOOLS=1` to
+also list `ask_pipeworx` and the other gateway-wide tools.
 
-It speaks MCP over stdin/stdout and answers `initialize`/`tools/list`/`tools/call`
-for **only** this pack's tools — none of the shared meta-tools the gateway
-connection above adds. Same source, same tools, no ask_pipeworx routing.
+Behind an HTTPS proxy: Node's built-in `fetch` does not read `HTTPS_PROXY` by
+default. Newer Node releases honour it when `NODE_USE_ENV_PROXY=1` is set; check
+your Node version's documentation.
 
 ## Using with ask_pipeworx
 
